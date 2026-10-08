@@ -94,3 +94,10 @@ x86/
 
 # Publish Web Output
 *.[Pp]ublish.xml
+
+# CMake
+cmake-build-*/
+
+# JetBrains / CLion
+.idea/
+*.iml
