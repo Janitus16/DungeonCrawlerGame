@@ -1,107 +1,263 @@
 #include "ConsoleControl.h"
-#include <conio.h>
 
-HANDLE ConsoleControl::GetConsole() 
+#include <iostream>
+
+#ifdef _WIN32
+#include <conio.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#endif
+
+namespace
 {
-	return GetInstance()._console;
+    std::mutex consoleMutex;
+
+#ifdef _WIN32
+
+    bool KeyAvailable()
+    {
+        return _kbhit() != 0;
+    }
+
+    int ReadKey()
+    {
+        return _getch();
+    }
+
+#else
+
+    class TerminalRawMode
+    {
+    private:
+        termios _originalSettings{};
+        bool _enabled = false;
+
+    public:
+        TerminalRawMode()
+        {
+            if (tcgetattr(STDIN_FILENO, &_originalSettings) == 0)
+            {
+                termios raw = _originalSettings;
+
+                raw.c_lflag &= ~(ICANON | ECHO);
+                raw.c_cc[VMIN] = 0;
+                raw.c_cc[VTIME] = 0;
+
+                tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+                _enabled = true;
+            }
+        }
+
+        ~TerminalRawMode()
+        {
+            if (_enabled)
+            {
+                tcsetattr(STDIN_FILENO, TCSANOW, &_originalSettings);
+            }
+        }
+    };
+
+    TerminalRawMode& GetTerminalRawMode()
+    {
+        static TerminalRawMode terminal;
+        return terminal;
+    }
+
+    bool KeyAvailable()
+    {
+        GetTerminalRawMode();
+
+        timeval timeout{};
+        fd_set readSet;
+
+        FD_ZERO(&readSet);
+        FD_SET(STDIN_FILENO, &readSet);
+
+        return select(STDIN_FILENO + 1, &readSet, nullptr, nullptr, &timeout) > 0;
+    }
+
+    int ReadKey()
+    {
+        GetTerminalRawMode();
+
+        unsigned char character = 0;
+
+        if (read(STDIN_FILENO, &character, 1) != 1)
+        {
+            return 0;
+        }
+
+        // Arrow keys arrive as:
+        // UP    = ESC [ A
+        // DOWN  = ESC [ B
+        // RIGHT = ESC [ C
+        // LEFT  = ESC [ D
+
+        if (character == 27)
+        {
+            unsigned char sequence[2];
+
+            if (read(STDIN_FILENO, &sequence[0], 1) == 1 &&
+                read(STDIN_FILENO, &sequence[1], 1) == 1)
+            {
+                if (sequence[0] == '[')
+                {
+                    switch (sequence[1])
+                    {
+                    case 'A':
+                        return 72; // K_UP
+
+                    case 'B':
+                        return 80; // K_DOWN
+
+                    case 'C':
+                        return 77; // K_RIGHT
+
+                    case 'D':
+                        return 75; // K_LEFT
+                    }
+                }
+            }
+
+            return 27; // ESC
+        }
+
+        return character;
+    }
+
+#endif
+
+    int GetAnsiTextColor(ConsoleControl::ConsoleColor color)
+    {
+        if (color >= ConsoleControl::DARKGREY)
+        {
+            return 90 + (color - ConsoleControl::DARKGREY);
+        }
+
+        return 30 + color;
+    }
+
+    int GetAnsiBackgroundColor(ConsoleControl::ConsoleColor color)
+    {
+        if (color >= ConsoleControl::DARKGREY)
+        {
+            return 100 + (color - ConsoleControl::DARKGREY);
+        }
+
+        return 40 + color;
+    }
 }
 
-void ConsoleControl::SetColor(ConsoleColor TextColor, ConsoleColor BackgroundColor)
+void ConsoleControl::SetColor(
+    ConsoleColor TextColor,
+    ConsoleColor BackgroundColor)
 {
-	WORD color = (BackgroundColor << 4) | TextColor;
-	SetConsoleTextAttribute(GetConsole(), color);
+    std::cout
+        << "\033["
+        << GetAnsiTextColor(TextColor)
+        << ";"
+        << GetAnsiBackgroundColor(BackgroundColor)
+        << "m";
 }
 
 void ConsoleControl::SetPosition(short int x, short int y)
 {
-	COORD pos = { x, y };
-	SetConsoleCursorPosition(GetConsole(), pos);
+    std::cout
+        << "\033["
+        << (y + 1)
+        << ";"
+        << (x + 1)
+        << "H";
 }
 
 void ConsoleControl::Clear()
 {
-	std::cout << "\033[2J\033[1;1H";//Clear the console and move the cursor to the top left corner
-	//ClearCharacter(' ', WHITE, BLACK);//Another less optimal way to clean
+    std::cout << "\033[2J\033[1;1H";
 }
 
-void ConsoleControl::FillWithCharacter(char character, ConsoleColor TextColor, ConsoleColor BackgroundColor)
+void ConsoleControl::FillWithCharacter(
+    char character,
+    ConsoleColor TextColor,
+    ConsoleColor BackgroundColor)
 {
-	COORD topLeft = { 0, 0 };
-	CONSOLE_SCREEN_BUFFER_INFO screen;
-	DWORD written;
-	HANDLE console = GetConsole();
-	WORD color = (BackgroundColor << 4) | TextColor;
-	GetConsoleScreenBufferInfo(console, &screen);
-	FillConsoleOutputCharacterA(
-		console, character, screen.dwSize.X * screen.dwSize.Y, topLeft, &written
-	);
-	FillConsoleOutputAttribute(
-		console, color,
-		screen.dwSize.X * screen.dwSize.Y, topLeft, &written
-	);
-	SetConsoleCursorPosition(console, topLeft);
+    int width = 80;
+    int height = 25;
+
+#ifdef _WIN32
+    // Keep a safe default on Windows.
+    // The game already uses the console normally.
+#else
+    winsize terminalSize{};
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminalSize) == 0)
+    {
+        width = terminalSize.ws_col;
+        height = terminalSize.ws_row;
+    }
+#endif
+
+    SetColor(TextColor, BackgroundColor);
+
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            std::cout << character;
+        }
+    }
+
+    SetColor(WHITE, BLACK);
+    SetPosition(0, 0);
 }
 
 void ConsoleControl::ClearKeyBuffer()
 {
-	while (_kbhit()) {
-		_getch();
-	}
+    while (KeyAvailable())
+    {
+        ReadKey();
+    }
 }
 
 int ConsoleControl::ReadNextKey()
 {
-	int KB_code = 0;
+    if (KeyAvailable())
+    {
+        return ReadKey();
+    }
 
-	if (_kbhit())
-	{
-		KB_code = _getch();
-	}
-	return KB_code;
+    return 0;
 }
 
 int ConsoleControl::WaithForReadNextKey()
 {
-	int KB_code = 0;
+    int key = 0;
 
-	while (KB_code == 0)
-	{
-		if (_kbhit())
-		{
-			KB_code = _getch();
-		}
-	}
+    while (key == 0)
+    {
+        if (KeyAvailable())
+        {
+            key = ReadKey();
+        }
+    }
 
-	return KB_code;
+    return key;
 }
 
 char ConsoleControl::WaitForReadNextChar()
 {
-	char c = 0;
-
-	while (c == 0)
-	{
-		if (_kbhit())
-		{
-			c = _getch();
-		}
-	}
-
-	return c;
-}
-
-ConsoleControl ConsoleControl::GetInstance() {
-	static ConsoleControl instance;
-
-	return instance;
+    return static_cast<char>(WaithForReadNextKey());
 }
 
 void ConsoleControl::Lock()
 {
-	GetInstance()._consoleMutex->lock();
+    consoleMutex.lock();
 }
 
 void ConsoleControl::Unlock()
 {
-	GetInstance()._consoleMutex->unlock();
+    consoleMutex.unlock();
 }
